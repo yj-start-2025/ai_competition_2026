@@ -2,8 +2,9 @@ import io
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
+from queue import Queue, Empty
 
 import pandas as pd
 import streamlit as st
@@ -650,7 +651,7 @@ PROMPT_TEMPLATE = """
 """
 
 
-def analyze_course(group, course_title, review_col, rating_col, id_col):
+def analyze_course(group, course_title, review_col, rating_col, id_col, progress_callback=None):
     # 모든 유효 후기 사용
     sample = group.copy()
 
@@ -679,6 +680,9 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
         n_reviews=len(sample),
         reviews_block="\n".join(lines),
     )
+
+    if progress_callback:
+        progress_callback("① AI 종합분석", 1)
 
     response = client.responses.create(
         model=MODEL,
@@ -728,6 +732,9 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
     result["classified_reviews"] = len(sentiment_map)
     result["analysis_review_count"] = len(sample)
 
+    if progress_callback:
+        progress_callback("② 대표후기 선정", 2)
+
     representative = select_representative_reviews(
         sample=sample,
         result=result,
@@ -736,11 +743,17 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
         target_n=10,
     )
 
+    if progress_callback:
+        progress_callback("③ 개인별 피드백 생성", 3)
+
     result["individual_feedback"] = generate_feedback_for_selected(
         selected=representative,
         review_col=review_col,
         id_col=id_col,
     )
+
+    if progress_callback:
+        progress_callback("✅ 완료", 4)
 
     return result
 
@@ -925,7 +938,8 @@ selected_courses = st.multiselect(
 
 st.caption(
     f"※ 여러 과정을 선택하면 최대 {MAX_PARALLEL_WORKERS}개 과정을 동시에 분석합니다. "
-    "같은 브라우저 세션에서 이미 분석한 과정은 재사용합니다."
+    "과정별로 AI 종합분석 → 대표후기 선정 → 개인별 피드백 생성 상태를 표시하며, "
+    "같은 브라우저 세션의 기존 결과는 재사용합니다."
 )
 
 if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
@@ -933,39 +947,76 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
         st.warning("분석할 과정을 하나 이상 선택해주세요.")
         st.stop()
 
-    # 같은 브라우저 세션에서 이미 분석한 과정은 재사용
     previous_results = st.session_state.get("results", {})
     previous_errors = st.session_state.get("errors", {})
 
-    results = dict(previous_results)
-    errors = dict(previous_errors)
+    results = {
+        course: result
+        for course, result in previous_results.items()
+        if course in selected_courses
+    }
+    errors = {
+        course: err
+        for course, err in previous_errors.items()
+        if course in selected_courses
+    }
 
-    # 현재 선택된 과정 중 아직 결과가 없는 과정만 새로 분석
     courses_to_run = [
         course for course in selected_courses
         if course not in results
     ]
 
-    # 선택에서 빠진 과정은 화면 결과에서도 제거
-    results = {
-        course: result
-        for course, result in results.items()
-        if course in selected_courses
-    }
-    errors = {
-        course: err
-        for course, err in errors.items()
-        if course in selected_courses
-    }
+    # 과정별 상태 표시
+    status_state = {}
+    for course in selected_courses:
+        if course in results:
+            status_state[course] = {
+                "상태": "♻️ 기존 결과 재사용",
+                "단계": 4,
+            }
+        else:
+            status_state[course] = {
+                "상태": "⏳ 대기",
+                "단계": 0,
+            }
 
     progress_bar = st.progress(0)
-    status_box = st.empty()
+    summary_box = st.empty()
+    status_table_box = st.empty()
+
+    def render_status():
+        rows = []
+        for course in selected_courses:
+            rows.append(
+                {
+                    "과정": course,
+                    "진행상태": status_state[course]["상태"],
+                }
+            )
+
+        status_table_box.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        total_units = len(selected_courses) * 4
+        completed_units = sum(
+            status_state[c]["단계"]
+            for c in selected_courses
+        )
+        progress_bar.progress(
+            min(completed_units / total_units, 1.0)
+            if total_units
+            else 1.0
+        )
+
+    render_status()
 
     if not courses_to_run:
-        status_box.success(
-            "✅ 선택한 과정은 현재 세션에 이미 분석 결과가 있어 재사용했습니다."
+        summary_box.success(
+            "✅ 선택한 모든 과정의 기존 분석 결과를 재사용했습니다."
         )
-        progress_bar.progress(1.0)
 
     else:
         worker_count = min(
@@ -973,17 +1024,26 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
             len(courses_to_run),
         )
 
-        status_box.info(
-            f"🔄 최대 {worker_count}개 과정을 병렬 분석합니다. "
-            f"신규 분석 대상 {len(courses_to_run)}개"
+        summary_box.info(
+            f"🔄 최대 {worker_count}개 과정 병렬 분석 중 · "
+            f"신규 {len(courses_to_run)}개 / 전체 {len(selected_courses)}개"
         )
 
-        completed = 0
+        event_queue = Queue()
 
         def _run_one_course(course_name):
             group = df[
                 df[course_col].astype(str) == str(course_name)
             ].copy()
+
+            def callback(stage_text, stage_no):
+                event_queue.put(
+                    {
+                        "course": course_name,
+                        "status": stage_text,
+                        "stage": stage_no,
+                    }
+                )
 
             result = analyze_course(
                 group=group,
@@ -991,7 +1051,9 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
                 review_col=review_col,
                 rating_col=rating_col,
                 id_col=id_col,
+                progress_callback=callback,
             )
+
             return course_name, result, len(group)
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -1000,35 +1062,82 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
                 for course in courses_to_run
             }
 
-            for future in as_completed(future_map):
-                course = future_map[future]
+            pending = set(future_map.keys())
 
-                try:
-                    course_name, result, review_count = future.result()
-                    results[course_name] = result
-                    errors.pop(course_name, None)
+            while pending:
+                # worker thread가 보낸 단계 이벤트를 UI에 반영
+                while True:
+                    try:
+                        event = event_queue.get_nowait()
+                    except Empty:
+                        break
 
-                    completed += 1
-                    status_box.info(
-                        f"🔄 {completed}/{len(courses_to_run)} 신규 과정 완료 · "
-                        f"{course_name} ({review_count:,}건)"
-                    )
-                except Exception as e:
-                    errors[course] = str(e)
-                    completed += 1
-                    status_box.warning(
-                        f"⚠️ {completed}/{len(courses_to_run)} 처리 · "
-                        f"{course} 분석 실패"
-                    )
+                    course_name = event["course"]
+                    status_state[course_name] = {
+                        "상태": event["status"],
+                        "단계": event["stage"],
+                    }
+                    render_status()
 
-                progress_bar.progress(
-                    completed / len(courses_to_run)
+                done, pending = wait(
+                    pending,
+                    timeout=0.20,
+                    return_when=FIRST_COMPLETED,
                 )
 
-        status_box.success(
-            f"✅ 분석 완료 · 신규 {len(courses_to_run)}개 과정 처리 · "
-            f"최대 {worker_count}개 병렬 실행"
+                for future in done:
+                    course = future_map[future]
+
+                    try:
+                        course_name, result, review_count = future.result()
+                        results[course_name] = result
+                        errors.pop(course_name, None)
+
+                        status_state[course_name] = {
+                            "상태": f"✅ 완료 ({review_count:,}건)",
+                            "단계": 4,
+                        }
+                    except Exception as e:
+                        errors[course] = str(e)
+                        status_state[course] = {
+                            "상태": "⚠️ 분석 실패",
+                            "단계": 4,
+                        }
+
+                    render_status()
+
+            # 마지막으로 남아 있는 큐 이벤트 소진
+            while True:
+                try:
+                    event = event_queue.get_nowait()
+                except Empty:
+                    break
+
+                course_name = event["course"]
+                # 이미 완료된 과정의 상태는 다시 이전 단계로 되돌리지 않음
+                if not status_state[course_name]["상태"].startswith(("✅", "⚠️")):
+                    status_state[course_name] = {
+                        "상태": event["status"],
+                        "단계": event["stage"],
+                    }
+
+            render_status()
+
+        success_count = sum(
+            1 for course in courses_to_run
+            if course in results
         )
+        fail_count = len(courses_to_run) - success_count
+
+        if fail_count == 0:
+            summary_box.success(
+                f"✅ 분석 완료 · 신규 {success_count}개 과정 · "
+                f"최대 {worker_count}개 병렬 실행"
+            )
+        else:
+            summary_box.warning(
+                f"⚠️ 분석 완료 · 성공 {success_count}개 / 실패 {fail_count}개"
+            )
 
     time.sleep(0.2)
 
