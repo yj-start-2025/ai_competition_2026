@@ -1,3 +1,4 @@
+import io
 import json
 import re
 import time
@@ -6,6 +7,26 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
+
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 
 # =========================================================
@@ -20,7 +41,6 @@ st.set_page_config(
 APP_TITLE = "수강후기 AI 분석 리포트"
 MODEL = "gpt-5.6-luna"
 SAMPLE_FILE = Path(__file__).with_name("reviews_seoul_center_final.csv")
-MAX_REVIEWS_PER_COURSE = 150
 
 st.title(f"📊 {APP_TITLE}")
 st.caption(
@@ -58,20 +78,10 @@ def normalize_name(value):
 
 
 def find_col(df, exact_candidates, partial_candidates=None, exclude=None):
-    """
-    1) exact_candidates를 우선 정확 매칭
-    2) 없으면 partial_candidates 부분 매칭
-    3) exclude에 포함되는 컬럼은 제외
-
-    review_id가 review 본문으로 잘못 인식되는 문제를 방지하기 위해
-    후기 본문은 content/text/후기 등 정확 매칭을 최우선으로 한다.
-    """
     partial_candidates = partial_candidates or []
     exclude = {normalize_name(x) for x in (exclude or [])}
-
     normalized = {col: normalize_name(col) for col in df.columns}
 
-    # exact match
     for candidate in exact_candidates:
         c = normalize_name(candidate)
         for col, ncol in normalized.items():
@@ -80,7 +90,6 @@ def find_col(df, exact_candidates, partial_candidates=None, exclude=None):
             if ncol == c:
                 return col
 
-    # partial match
     for candidate in partial_candidates:
         c = normalize_name(candidate)
         for col, ncol in normalized.items():
@@ -112,18 +121,20 @@ def load_sample(path_str):
 
 def clean_dataframe(df, course_col, review_col, rating_col):
     work = df.copy()
+    original_n = len(work)
 
     work = work.dropna(subset=[course_col, review_col])
     work[course_col] = work[course_col].astype(str).str.strip()
     work[review_col] = work[review_col].astype(str).str.strip()
 
-    # 공백 또는 지나치게 짧은 응답 제거
-    work = work[work[review_col].str.len() >= 3]
+    # 의미 없는 공백만 제거하고, 짧은 후기 자체는 보존
+    work = work[work[review_col].str.len() >= 1]
 
     if rating_col:
         work[rating_col] = pd.to_numeric(work[rating_col], errors="coerce")
 
-    return work.reset_index(drop=True)
+    removed_n = original_n - len(work)
+    return work.reset_index(drop=True), removed_n
 
 
 def extract_json(text):
@@ -152,7 +163,6 @@ def safe_list(obj, key, limit=None):
     value = obj.get(key, [])
     if not isinstance(value, list):
         return []
-
     return value[:limit] if limit else value
 
 
@@ -161,10 +171,6 @@ def compact_text(text):
 
 
 def compute_keyword_frequencies(sample, review_col, keywords):
-    """
-    GPT가 뽑은 키워드와 유사표현(aliases)이 실제 몇 개 후기에서 등장하는지
-    Python이 다시 계산한다.
-    """
     review_texts = [compact_text(x) for x in sample[review_col].astype(str)]
 
     for kw in keywords:
@@ -212,7 +218,314 @@ def build_course_overview(df, course_col, rating_col):
 
 
 # =========================================================
-# 3. 분석 프롬프트
+# 3. 리포트 생성
+# =========================================================
+def result_to_rows(result):
+    counts = result.get("sentiment_counts", {})
+    return {
+        "positive": int(counts.get("positive", 0) or 0),
+        "neutral": int(counts.get("neutral", 0) or 0),
+        "negative": int(counts.get("negative", 0) or 0),
+        "analysis_n": int(result.get("analysis_review_count", 0) or 0),
+    }
+
+
+def build_docx_report(results):
+    doc = Document()
+
+    styles = doc.styles
+    styles["Normal"].font.name = "Malgun Gothic"
+    styles["Normal"].font.size = Pt(10)
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("수강후기 AI 분석 리포트")
+    run.bold = True
+    run.font.size = Pt(18)
+
+    doc.add_paragraph(
+        "생성형 AI를 활용하여 과정별 핵심 키워드, 감성, 주요 의견, "
+        "개선방안 및 개인별 피드백을 자동 분석한 결과입니다."
+    )
+
+    for idx, (course, result) in enumerate(results.items(), start=1):
+        doc.add_heading(f"{idx}. {course}", level=1)
+
+        summary = result.get("executive_summary", "")
+        if summary:
+            doc.add_heading("AI 핵심 요약", level=2)
+            doc.add_paragraph(summary)
+
+        counts = result_to_rows(result)
+        doc.add_heading("감성 분석", level=2)
+
+        table = doc.add_table(rows=2, cols=4)
+        table.style = "Table Grid"
+        headers = ["분석 후기", "긍정", "중립", "부정"]
+        values = [
+            counts["analysis_n"],
+            counts["positive"],
+            counts["neutral"],
+            counts["negative"],
+        ]
+        for j, h in enumerate(headers):
+            table.cell(0, j).text = h
+            table.cell(1, j).text = str(values[j])
+
+        doc.add_heading("핵심 키워드 TOP 10", level=2)
+        kw_table = doc.add_table(rows=1, cols=3)
+        kw_table.style = "Table Grid"
+        kw_table.rows[0].cells[0].text = "키워드"
+        kw_table.rows[0].cells[1].text = "빈도"
+        kw_table.rows[0].cells[2].text = "의미"
+
+        for kw in result.get("keywords", [])[:10]:
+            cells = kw_table.add_row().cells
+            cells[0].text = str(kw.get("word", ""))
+            cells[1].text = str(kw.get("frequency", 0))
+            cells[2].text = str(kw.get("meaning", ""))
+
+        reasons = result.get("sentiment_reasons", {})
+        for label, key in [
+            ("긍정 주요 사유", "positive"),
+            ("중립 주요 사유", "neutral"),
+            ("부정·개선 요구 주요 사유", "negative"),
+        ]:
+            doc.add_heading(label, level=2)
+            vals = safe_list(reasons, key, 5)
+            if vals:
+                for v in vals:
+                    doc.add_paragraph(str(v), style="List Bullet")
+            else:
+                doc.add_paragraph("해당 의견 없음")
+
+        doc.add_heading("개선 방안 5가지", level=2)
+        for i, item in enumerate(
+            result.get("improvement_suggestions", [])[:5],
+            start=1,
+        ):
+            doc.add_paragraph(f"{i}. {item}")
+
+        doc.add_heading("개인별 피드백", level=2)
+        for fb in result.get("individual_feedback", [])[:10]:
+            rid = fb.get("review_id", "")
+            snippet = fb.get("review_snippet", "")
+            feedback = fb.get("feedback", "")
+            doc.add_paragraph(
+                f"교육생 의견 #{rid} - {snippet}",
+                style="List Bullet",
+            )
+            doc.add_paragraph(f"AI 피드백: {feedback}")
+
+        if idx < len(results):
+            doc.add_page_break()
+
+    footer = doc.sections[0].footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer.add_run(
+        "본 결과는 생성형 AI 기반 자동 분석 결과이며, 실제 업무 적용 시 담당자 최종 검토를 권장합니다."
+    )
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_pdf_report(results):
+    # ReportLab 기본 CID Korean font
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGoThic-Medium"))
+        body_font = "HYSMyeongJo-Medium"
+        bold_font = "HYGoThic-Medium"
+    except Exception:
+        body_font = "Helvetica"
+        bold_font = "Helvetica-Bold"
+
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "KTitle",
+        parent=styles["Title"],
+        fontName=bold_font,
+        fontSize=18,
+        leading=24,
+        alignment=TA_CENTER,
+        spaceAfter=10,
+    )
+
+    h1 = ParagraphStyle(
+        "KH1",
+        parent=styles["Heading1"],
+        fontName=bold_font,
+        fontSize=14,
+        leading=19,
+        spaceBefore=8,
+        spaceAfter=6,
+    )
+
+    h2 = ParagraphStyle(
+        "KH2",
+        parent=styles["Heading2"],
+        fontName=bold_font,
+        fontSize=11,
+        leading=15,
+        spaceBefore=6,
+        spaceAfter=4,
+    )
+
+    body = ParagraphStyle(
+        "KBody",
+        parent=styles["BodyText"],
+        fontName=body_font,
+        fontSize=9,
+        leading=13,
+        spaceAfter=4,
+    )
+
+    story = [
+        Paragraph("수강후기 AI 분석 리포트", title_style),
+        Paragraph(
+            "생성형 AI를 활용하여 과정별 핵심 키워드, 감성, 주요 의견, "
+            "개선방안 및 개인별 피드백을 자동 분석한 결과입니다.",
+            body,
+        ),
+        Spacer(1, 4 * mm),
+    ]
+
+    for idx, (course, result) in enumerate(results.items(), start=1):
+        story.append(Paragraph(f"{idx}. {course}", h1))
+
+        summary = result.get("executive_summary", "")
+        if summary:
+            story.append(Paragraph("AI 핵심 요약", h2))
+            story.append(Paragraph(summary, body))
+
+        counts = result_to_rows(result)
+
+        story.append(Paragraph("감성 분석", h2))
+        sentiment_data = [
+            ["분석 후기", "긍정", "중립", "부정"],
+            [
+                str(counts["analysis_n"]),
+                str(counts["positive"]),
+                str(counts["neutral"]),
+                str(counts["negative"]),
+            ],
+        ]
+        sentiment_table = Table(
+            sentiment_data,
+            colWidths=[35 * mm, 35 * mm, 35 * mm, 35 * mm],
+        )
+        sentiment_table.setStyle(
+            TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), body_font),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ])
+        )
+        story.append(sentiment_table)
+        story.append(Spacer(1, 3 * mm))
+
+        story.append(Paragraph("핵심 키워드 TOP 10", h2))
+        kw_data = [["키워드", "빈도", "의미"]]
+        for kw in result.get("keywords", [])[:10]:
+            kw_data.append([
+                str(kw.get("word", "")),
+                str(kw.get("frequency", 0)),
+                str(kw.get("meaning", "")),
+            ])
+
+        kw_table = Table(
+            kw_data,
+            colWidths=[35 * mm, 18 * mm, 122 * mm],
+            repeatRows=1,
+        )
+        kw_table.setStyle(
+            TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), body_font),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ])
+        )
+        story.append(kw_table)
+        story.append(Spacer(1, 3 * mm))
+
+        reasons = result.get("sentiment_reasons", {})
+        for label, key in [
+            ("긍정 주요 사유", "positive"),
+            ("중립 주요 사유", "neutral"),
+            ("부정·개선 요구 주요 사유", "negative"),
+        ]:
+            story.append(Paragraph(label, h2))
+            vals = safe_list(reasons, key, 5)
+            if vals:
+                for v in vals:
+                    story.append(Paragraph(f"• {v}", body))
+            else:
+                story.append(Paragraph("해당 의견 없음", body))
+
+        story.append(Paragraph("개선 방안 5가지", h2))
+        for i, item in enumerate(
+            result.get("improvement_suggestions", [])[:5],
+            start=1,
+        ):
+            story.append(Paragraph(f"{i}. {item}", body))
+
+        story.append(Paragraph("개인별 피드백", h2))
+        for fb in result.get("individual_feedback", [])[:10]:
+            rid = fb.get("review_id", "")
+            snippet = fb.get("review_snippet", "")
+            feedback = fb.get("feedback", "")
+            story.append(
+                Paragraph(
+                    f"• 교육생 의견 #{rid} - {snippet}",
+                    body,
+                )
+            )
+            story.append(
+                Paragraph(
+                    f"AI 피드백: {feedback}",
+                    body,
+                )
+            )
+
+        if idx < len(results):
+            story.append(PageBreak())
+
+    story.append(
+        Spacer(1, 4 * mm)
+    )
+    story.append(
+        Paragraph(
+            "본 결과는 생성형 AI 기반 자동 분석 결과이며, 실제 업무 적용 시 담당자 최종 검토를 권장합니다.",
+            body,
+        )
+    )
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# =========================================================
+# 4. 분석 프롬프트
 # =========================================================
 PROMPT_TEMPLATE = """
 당신은 직업훈련기관의 강의평가·수강후기를 분석하는 데이터 분석가입니다.
@@ -305,16 +618,9 @@ PROMPT_TEMPLATE = """
 
 
 def analyze_course(group, course_title, review_col, rating_col, id_col):
+    # 모든 유효 후기 사용
     sample = group.copy()
 
-    if len(sample) > MAX_REVIEWS_PER_COURSE:
-        sample = (
-            sample.sample(MAX_REVIEWS_PER_COURSE, random_state=42)
-            .sort_index()
-            .copy()
-        )
-
-    # 실제 리뷰ID가 없으면 원본 행번호 기반으로 임시 ID 생성
     if id_col:
         sample["_analysis_review_id"] = sample[id_col].astype(str)
     else:
@@ -344,12 +650,11 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
     response = client.responses.create(
         model=MODEL,
         input=prompt,
-        max_output_tokens=12000,
+        max_output_tokens=14000,
     )
 
     result = extract_json(response.output_text)
 
-    # 기본값
     result.setdefault("executive_summary", "")
     result.setdefault("keywords", [])
     result.setdefault("review_sentiments", [])
@@ -360,14 +665,12 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
     result.setdefault("improvement_suggestions", [])
     result.setdefault("individual_feedback", [])
 
-    # 키워드 빈도는 모델 숫자를 쓰지 않고 Python에서 재계산
     result["keywords"] = compute_keyword_frequencies(
         sample,
         review_col,
         result.get("keywords", [])[:10],
     )
 
-    # 리뷰별 감성 label을 Python으로 집계
     valid_ids = set(sample["_analysis_review_id"].astype(str))
     sentiment_map = {}
 
@@ -375,7 +678,11 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
         rid = str(item.get("review_id", ""))
         sentiment = str(item.get("sentiment", "")).lower()
 
-        if rid in valid_ids and sentiment in {"positive", "neutral", "negative"}:
+        if rid in valid_ids and sentiment in {
+            "positive",
+            "neutral",
+            "negative",
+        }:
             sentiment_map[rid] = sentiment
 
     counts = {
@@ -392,7 +699,7 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
 
 
 # =========================================================
-# 4. 데이터 선택
+# 5. 데이터 선택
 # =========================================================
 st.subheader("1. 분석 데이터")
 
@@ -437,7 +744,7 @@ if df is None:
 
 
 # =========================================================
-# 5. 컬럼 인식
+# 6. 컬럼 인식
 # =========================================================
 course_col = find_col(
     df,
@@ -484,7 +791,7 @@ if course_col is None or review_col is None:
     )
     st.stop()
 
-df = clean_dataframe(df, course_col, review_col, rating_col)
+df, removed_n = clean_dataframe(df, course_col, review_col, rating_col)
 
 if df.empty:
     st.error("분석 가능한 후기 데이터가 없습니다.")
@@ -492,7 +799,7 @@ if df.empty:
 
 
 # =========================================================
-# 6. 전체 데이터 대시보드
+# 7. 전체 데이터 대시보드
 # =========================================================
 st.subheader("2. 데이터 요약")
 
@@ -508,6 +815,11 @@ else:
     m3.metric("전체 평균 별점", "-")
 
 m4.metric("분석 모델", "GPT-5.6 Luna")
+
+if removed_n > 0:
+    st.caption(
+        f"※ 과정명 또는 후기본문이 비어 있는 {removed_n:,}건은 분석에서 제외했습니다."
+    )
 
 left_overview, right_overview = st.columns([1.15, 0.85])
 
@@ -550,15 +862,9 @@ with st.expander("원본 데이터 미리보기"):
         hide_index=True,
     )
 
-st.caption(
-    f"※ 과정별 후기가 {MAX_REVIEWS_PER_COURSE}건을 초과하면 "
-    f"API 비용과 처리시간을 줄이기 위해 최대 {MAX_REVIEWS_PER_COURSE}건을 "
-    "재현 가능한 방식(random_state=42)으로 표본 분석합니다."
-)
-
 
 # =========================================================
-# 7. 분석 실행
+# 8. 분석 실행
 # =========================================================
 st.subheader("3. AI 분석")
 
@@ -582,11 +888,11 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
     status_box = st.empty()
 
     for i, course in enumerate(selected_courses, start=1):
-        status_box.info(
-            f"🔄 {i}/{len(selected_courses)} 과정 분석 중 · {course}"
-        )
-
         group = df[df[course_col].astype(str) == str(course)]
+        status_box.info(
+            f"🔄 {i}/{len(selected_courses)} 과정 분석 중 · {course} "
+            f"({len(group):,}건 전체 분석)"
+        )
 
         try:
             results[course] = analyze_course(
@@ -604,8 +910,6 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
     status_box.success(
         f"✅ 분석 완료 · 총 {len(selected_courses)}개 과정 처리"
     )
-
-    # 완료 상태를 잠깐 보여준 뒤 진행바는 그대로 유지
     time.sleep(0.2)
 
     st.session_state["results"] = results
@@ -614,7 +918,7 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
 
 
 # =========================================================
-# 8. 결과 렌더링
+# 9. 결과 렌더링
 # =========================================================
 if "results" in st.session_state:
     st.subheader("4. 분석 결과")
@@ -718,7 +1022,6 @@ if "results" in st.session_state:
         with reason_cols[0]:
             st.markdown("##### 👍 긍정 주요 사유")
             values = safe_list(reasons, "positive", 5)
-
             if values:
                 for item in values:
                     st.markdown(f"- {item}")
@@ -728,7 +1031,6 @@ if "results" in st.session_state:
         with reason_cols[1]:
             st.markdown("##### ➖ 중립 주요 사유")
             values = safe_list(reasons, "neutral", 5)
-
             if values:
                 for item in values:
                     st.markdown(f"- {item}")
@@ -738,7 +1040,6 @@ if "results" in st.session_state:
         with reason_cols[2]:
             st.markdown("##### 👎 부정·개선 요구 주요 사유")
             values = safe_list(reasons, "negative", 5)
-
             if values:
                 for item in values:
                     st.markdown(f"- {item}")
@@ -748,7 +1049,6 @@ if "results" in st.session_state:
         st.markdown("#### 🛠️ 개선 방안 5가지")
 
         improvements = result.get("improvement_suggestions", [])[:5]
-
         if improvements:
             for idx, improvement in enumerate(improvements, start=1):
                 st.markdown(f"**{idx}.** {improvement}")
@@ -758,12 +1058,10 @@ if "results" in st.session_state:
         st.markdown("#### 💬 개인별 피드백")
 
         feedbacks = result.get("individual_feedback", [])[:10]
-
         if feedbacks:
             for fb in feedbacks:
                 review_id = fb.get("review_id", "")
                 snippet = fb.get("review_snippet", "")
-
                 title = (
                     f"교육생 의견 #{review_id} · {snippet}"
                     if review_id
@@ -777,14 +1075,40 @@ if "results" in st.session_state:
             st.info("개인별 피드백 결과가 없습니다.")
 
     st.divider()
+    st.markdown("### 📄 분석 리포트 다운로드")
 
-    st.download_button(
-        "📥 전체 분석 결과 JSON 다운로드",
-        data=json.dumps(results, ensure_ascii=False, indent=2),
-        file_name="analysis_results.json",
-        mime="application/json",
-        use_container_width=True,
-    )
+    download_cols = st.columns(3)
+
+    with download_cols[0]:
+        st.download_button(
+            "📝 Word 리포트 다운로드",
+            data=build_docx_report(results),
+            file_name="수강후기_AI_분석_리포트.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+
+    with download_cols[1]:
+        try:
+            pdf_bytes = build_pdf_report(results)
+            st.download_button(
+                "📕 PDF 리포트 다운로드",
+                data=pdf_bytes,
+                file_name="수강후기_AI_분석_리포트.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.warning(f"PDF 생성 실패: {e}")
+
+    with download_cols[2]:
+        st.download_button(
+            "🧾 JSON 원본 다운로드",
+            data=json.dumps(results, ensure_ascii=False, indent=2),
+            file_name="analysis_results.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
     st.caption(
         "본 결과는 생성형 AI를 활용한 자동 분석 결과이며, "
