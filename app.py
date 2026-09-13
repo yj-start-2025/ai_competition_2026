@@ -2,6 +2,7 @@ import io
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +25,7 @@ st.set_page_config(
 
 APP_TITLE = "수강후기 AI 분석 리포트"
 MODEL = "gpt-5.6-luna"
+MAX_PARALLEL_WORKERS = 3
 SAMPLE_FILE = Path(__file__).with_name("reviews_seoul_center_final.csv")
 
 st.title(f"📊 {APP_TITLE}")
@@ -921,40 +923,113 @@ selected_courses = st.multiselect(
     default=courses,
 )
 
+st.caption(
+    f"※ 여러 과정을 선택하면 최대 {MAX_PARALLEL_WORKERS}개 과정을 동시에 분석합니다. "
+    "같은 브라우저 세션에서 이미 분석한 과정은 재사용합니다."
+)
+
 if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
     if not selected_courses:
         st.warning("분석할 과정을 하나 이상 선택해주세요.")
         st.stop()
 
-    results = {}
-    errors = {}
+    # 같은 브라우저 세션에서 이미 분석한 과정은 재사용
+    previous_results = st.session_state.get("results", {})
+    previous_errors = st.session_state.get("errors", {})
+
+    results = dict(previous_results)
+    errors = dict(previous_errors)
+
+    # 현재 선택된 과정 중 아직 결과가 없는 과정만 새로 분석
+    courses_to_run = [
+        course for course in selected_courses
+        if course not in results
+    ]
+
+    # 선택에서 빠진 과정은 화면 결과에서도 제거
+    results = {
+        course: result
+        for course, result in results.items()
+        if course in selected_courses
+    }
+    errors = {
+        course: err
+        for course, err in errors.items()
+        if course in selected_courses
+    }
 
     progress_bar = st.progress(0)
     status_box = st.empty()
 
-    for i, course in enumerate(selected_courses, start=1):
-        group = df[df[course_col].astype(str) == str(course)]
-        status_box.info(
-            f"🔄 {i}/{len(selected_courses)} 과정 분석 중 · {course} "
-            f"({len(group):,}건 전체 분석)"
+    if not courses_to_run:
+        status_box.success(
+            "✅ 선택한 과정은 현재 세션에 이미 분석 결과가 있어 재사용했습니다."
+        )
+        progress_bar.progress(1.0)
+
+    else:
+        worker_count = min(
+            MAX_PARALLEL_WORKERS,
+            len(courses_to_run),
         )
 
-        try:
-            results[course] = analyze_course(
+        status_box.info(
+            f"🔄 최대 {worker_count}개 과정을 병렬 분석합니다. "
+            f"신규 분석 대상 {len(courses_to_run)}개"
+        )
+
+        completed = 0
+
+        def _run_one_course(course_name):
+            group = df[
+                df[course_col].astype(str) == str(course_name)
+            ].copy()
+
+            result = analyze_course(
                 group=group,
-                course_title=course,
+                course_title=course_name,
                 review_col=review_col,
                 rating_col=rating_col,
                 id_col=id_col,
             )
-        except Exception as e:
-            errors[course] = str(e)
+            return course_name, result, len(group)
 
-        progress_bar.progress(i / len(selected_courses))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(_run_one_course, course): course
+                for course in courses_to_run
+            }
 
-    status_box.success(
-        f"✅ 분석 완료 · 총 {len(selected_courses)}개 과정 처리"
-    )
+            for future in as_completed(future_map):
+                course = future_map[future]
+
+                try:
+                    course_name, result, review_count = future.result()
+                    results[course_name] = result
+                    errors.pop(course_name, None)
+
+                    completed += 1
+                    status_box.info(
+                        f"🔄 {completed}/{len(courses_to_run)} 신규 과정 완료 · "
+                        f"{course_name} ({review_count:,}건)"
+                    )
+                except Exception as e:
+                    errors[course] = str(e)
+                    completed += 1
+                    status_box.warning(
+                        f"⚠️ {completed}/{len(courses_to_run)} 처리 · "
+                        f"{course} 분석 실패"
+                    )
+
+                progress_bar.progress(
+                    completed / len(courses_to_run)
+                )
+
+        status_box.success(
+            f"✅ 분석 완료 · 신규 {len(courses_to_run)}개 과정 처리 · "
+            f"최대 {worker_count}개 병렬 실행"
+        )
+
     time.sleep(0.2)
 
     st.session_state["results"] = results
