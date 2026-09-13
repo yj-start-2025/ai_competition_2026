@@ -1,11 +1,16 @@
 import json
 import re
+import time
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+
+# =========================================================
+# 0. 기본 설정
+# =========================================================
 st.set_page_config(
     page_title="수강후기 AI 분석 리포트",
     page_icon="📊",
@@ -19,43 +24,84 @@ MAX_REVIEWS_PER_COURSE = 150
 
 st.title(f"📊 {APP_TITLE}")
 st.caption(
-    "수강후기 데이터를 업로드하면 과정별 핵심 키워드, 감성분석, 주요 의견, "
-    "개선방안 및 개인별 피드백을 생성합니다."
+    "수강후기 데이터를 기반으로 과정별 핵심 키워드, 감성, 주요 의견, "
+    "개선방안 및 개인별 피드백을 자동으로 분석합니다."
 )
 
+
+# =========================================================
+# 1. OpenAI API
+# =========================================================
 try:
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 except Exception:
     st.error(
         "OpenAI API 키가 설정되지 않았습니다. "
-        "Streamlit Cloud의 App settings → Secrets에 "
+        "Streamlit Cloud → App settings → Secrets에 "
         'OPENAI_API_KEY = "sk-..." 형식으로 등록해주세요.'
     )
     st.stop()
 
 
-def normalize_name(x):
-    return str(x).strip().lower().replace(" ", "").replace("_", "")
+# =========================================================
+# 2. 데이터 유틸리티
+# =========================================================
+def normalize_name(value):
+    return (
+        str(value)
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
 
 
-def find_col(df, candidates):
+def find_col(df, exact_candidates, partial_candidates=None, exclude=None):
+    """
+    1) exact_candidates를 우선 정확 매칭
+    2) 없으면 partial_candidates 부분 매칭
+    3) exclude에 포함되는 컬럼은 제외
+
+    review_id가 review 본문으로 잘못 인식되는 문제를 방지하기 위해
+    후기 본문은 content/text/후기 등 정확 매칭을 최우선으로 한다.
+    """
+    partial_candidates = partial_candidates or []
+    exclude = {normalize_name(x) for x in (exclude or [])}
+
     normalized = {col: normalize_name(col) for col in df.columns}
-    for candidate in candidates:
+
+    # exact match
+    for candidate in exact_candidates:
         c = normalize_name(candidate)
         for col, ncol in normalized.items():
-            if c == ncol or c in ncol or ncol in c:
+            if ncol in exclude:
+                continue
+            if ncol == c:
                 return col
+
+    # partial match
+    for candidate in partial_candidates:
+        c = normalize_name(candidate)
+        for col, ncol in normalized.items():
+            if ncol in exclude:
+                continue
+            if c in ncol or ncol in c:
+                return col
+
     return None
 
 
 def load_dataframe(file_obj):
     name = file_obj.name.lower()
+
     if name.endswith(".csv"):
         try:
             return pd.read_csv(file_obj)
         except UnicodeDecodeError:
             file_obj.seek(0)
             return pd.read_csv(file_obj, encoding="cp949")
+
     return pd.read_excel(file_obj)
 
 
@@ -66,12 +112,17 @@ def load_sample(path_str):
 
 def clean_dataframe(df, course_col, review_col, rating_col):
     work = df.copy()
+
     work = work.dropna(subset=[course_col, review_col])
     work[course_col] = work[course_col].astype(str).str.strip()
     work[review_col] = work[review_col].astype(str).str.strip()
+
+    # 공백 또는 지나치게 짧은 응답 제거
     work = work[work[review_col].str.len() >= 3]
+
     if rating_col:
         work[rating_col] = pd.to_numeric(work[rating_col], errors="coerce")
+
     return work.reset_index(drop=True)
 
 
@@ -90,8 +141,10 @@ def extract_json(text):
 
     start = text.find("{")
     end = text.rfind("}")
+
     if start == -1 or end == -1 or end <= start:
-        raise ValueError("JSON 객체를 찾지 못했습니다.")
+        raise ValueError("모델 응답에서 JSON 객체를 찾지 못했습니다.")
+
     return json.loads(text[start:end + 1])
 
 
@@ -99,14 +152,73 @@ def safe_list(obj, key, limit=None):
     value = obj.get(key, [])
     if not isinstance(value, list):
         return []
+
     return value[:limit] if limit else value
 
 
+def compact_text(text):
+    return re.sub(r"\s+", "", str(text).lower())
+
+
+def compute_keyword_frequencies(sample, review_col, keywords):
+    """
+    GPT가 뽑은 키워드와 유사표현(aliases)이 실제 몇 개 후기에서 등장하는지
+    Python이 다시 계산한다.
+    """
+    review_texts = [compact_text(x) for x in sample[review_col].astype(str)]
+
+    for kw in keywords:
+        terms = [kw.get("word", "")]
+        aliases = kw.get("aliases", [])
+
+        if isinstance(aliases, list):
+            terms.extend(aliases)
+
+        terms = [compact_text(x) for x in terms if str(x).strip()]
+        terms = list(dict.fromkeys(terms))
+
+        count = 0
+        for text in review_texts:
+            if any(term and term in text for term in terms):
+                count += 1
+
+        kw["frequency"] = count
+
+    return keywords
+
+
+def build_course_overview(df, course_col, rating_col):
+    if rating_col and df[rating_col].notna().any():
+        overview = (
+            df.groupby(course_col)
+            .agg(
+                후기수=(course_col, "size"),
+                평균별점=(rating_col, "mean"),
+            )
+            .reset_index()
+            .rename(columns={course_col: "과정명"})
+        )
+        overview["평균별점"] = overview["평균별점"].round(2)
+    else:
+        overview = (
+            df.groupby(course_col)
+            .size()
+            .reset_index(name="후기수")
+            .rename(columns={course_col: "과정명"})
+        )
+        overview["평균별점"] = None
+
+    return overview.sort_values("후기수", ascending=False).reset_index(drop=True)
+
+
+# =========================================================
+# 3. 분석 프롬프트
+# =========================================================
 PROMPT_TEMPLATE = """
 당신은 직업훈련기관의 강의평가·수강후기를 분석하는 데이터 분석가입니다.
 
-아래는 하나의 교육과정에 대한 수강생 후기입니다.
-각 후기에는 [리뷰번호], 선택적으로 [별점], [후기본문]이 있습니다.
+아래는 하나의 교육과정에 대한 후기 목록입니다.
+각 행에는 [리뷰ID], 선택적으로 [별점], [후기본문]이 있습니다.
 
 [과정명]
 {course_title}
@@ -117,56 +229,74 @@ PROMPT_TEMPLATE = """
 [후기 목록]
 {reviews_block}
 
-아래 기준을 반드시 지켜 분석하십시오.
+다음 업무를 수행하십시오.
 
-1. 핵심 키워드 정확히 10개
-- 단순 조사·일반어가 아니라 교육과정 개선에 의미가 있는 명사/명사구 중심
-- frequency는 해당 키워드 또는 같은 의미의 표현이 등장한 '후기 건수'를 기준으로 가능한 한 정확하게 계산
-- meaning은 이 교육과정에서 그 키워드가 어떤 의미인지 한 문장으로 설명
+1. executive_summary
+- 이 과정의 강점과 핵심 개선과제를 2~3문장으로 요약
+- 후기에서 확인되는 내용만 사용
 
-2. 감성 분석
-- 모든 분석대상 후기를 긍정/중립/부정 중 하나로 분류했다고 가정하고 합계가 반드시 {n_reviews}가 되게 함
-- 긍정, 중립, 부정의 주요 사유를 각각 최대 5개 제시
-- 해당 감성이 거의 없다면 억지로 지어내지 말고 빈 배열 허용
+2. keywords
+- 교육과정 개선에 의미 있는 핵심 키워드 정확히 10개
+- word: 대표 키워드
+- aliases: 후기에서 실제 함께 사용되는 유사 표현 0~5개
+- meaning: 이 과정에서 해당 키워드가 의미하는 바 한 문장
+- frequency는 반환하지 마십시오. Python이 실제 후기에서 다시 계산합니다.
 
-3. 개선방안
-- 후기 근거를 바탕으로 구체적이고 실행 가능한 개선방안 정확히 5개
+3. review_sentiments
+- 모든 {n_reviews}개 후기 각각을 positive / neutral / negative 중 하나로 분류
+- review_id는 제공된 실제 [리뷰ID]를 그대로 사용
+- 후기 수와 sentiment label 수가 정확히 일치해야 함
 
-4. 개인별 피드백
-- 대표성이 높은 후기 최대 10개를 골라 작성
-- review_no에는 아래 후기 목록의 실제 리뷰번호를 사용
-- feedback은 해당 수강생에게 전달 가능한 정중하고 구체적인 메시지
-- 단순 칭찬 반복보다 의견 반영/추가 학습/보완 방향이 드러나게 작성
+4. sentiment_reasons
+- positive / neutral / negative의 대표적인 사유를 각각 최대 5개
+- 해당 감성이 거의 없으면 빈 배열 허용
+- 억지로 내용을 만들어내지 말 것
+
+5. improvement_suggestions
+- 후기 내용에 직접 근거한 구체적이고 실행 가능한 개선방안 정확히 5개
+
+6. individual_feedback
+- 리뷰가 10개 이상이면 반드시 서로 다른 리뷰 10개를 선택
+- 리뷰가 10개 미만이면 가능한 리뷰 전부 선택
+- review_id에는 제공된 실제 [리뷰ID] 사용
+- review_snippet은 해당 리뷰 원문 일부(50자 이내)
+- feedback은 해당 의견에 대응하는 정중하고 구체적인 피드백
+- 단순 칭찬 반복보다 의견 반영, 추가 학습, 운영 보완 방향이 드러나게 작성
 
 중요:
 - 후기에서 확인되지 않는 사실을 만들지 마십시오.
 - 개인정보를 추정하거나 생성하지 마십시오.
+- 리뷰 ID와 후기 내용을 혼동하지 마십시오.
 - 반드시 아래 JSON 구조만 반환하십시오.
 - 코드블록, 머리말, 설명문을 붙이지 마십시오.
 
 {{
+  "executive_summary": "요약",
   "keywords": [
     {{
       "word": "키워드",
-      "frequency": 0,
-      "meaning": "의미 설명"
+      "aliases": ["유사표현1", "유사표현2"],
+      "meaning": "의미"
     }}
   ],
-  "sentiment_summary": {{
-    "positive_count": 0,
-    "neutral_count": 0,
-    "negative_count": 0,
-    "positive_reasons": ["사유"],
-    "neutral_reasons": ["사유"],
-    "negative_reasons": ["사유"]
+  "review_sentiments": [
+    {{
+      "review_id": "실제 리뷰ID",
+      "sentiment": "positive"
+    }}
+  ],
+  "sentiment_reasons": {{
+    "positive": ["사유"],
+    "neutral": ["사유"],
+    "negative": ["사유"]
   }},
   "improvement_suggestions": [
     "개선방안"
   ],
   "individual_feedback": [
     {{
-      "review_no": 1,
-      "review_snippet": "원문 일부 50자 이내",
+      "review_id": "실제 리뷰ID",
+      "review_snippet": "원문 일부",
       "feedback": "개인별 피드백"
     }}
   ]
@@ -174,23 +304,36 @@ PROMPT_TEMPLATE = """
 """
 
 
-def analyze_course(group, course_title, review_col, rating_col):
+def analyze_course(group, course_title, review_col, rating_col, id_col):
     sample = group.copy()
 
     if len(sample) > MAX_REVIEWS_PER_COURSE:
-        sample = sample.sample(
-            MAX_REVIEWS_PER_COURSE,
-            random_state=42,
-        ).sort_index()
+        sample = (
+            sample.sample(MAX_REVIEWS_PER_COURSE, random_state=42)
+            .sort_index()
+            .copy()
+        )
+
+    # 실제 리뷰ID가 없으면 원본 행번호 기반으로 임시 ID 생성
+    if id_col:
+        sample["_analysis_review_id"] = sample[id_col].astype(str)
+    else:
+        sample["_analysis_review_id"] = (sample.index + 1).astype(str)
 
     lines = []
-    for review_no, (_, row) in enumerate(sample.iterrows(), start=1):
+
+    for _, row in sample.iterrows():
+        review_id = row["_analysis_review_id"]
+
         rating_txt = ""
         if rating_col and pd.notna(row.get(rating_col)):
             rating_txt = f"[별점 {row[rating_col]}] "
 
         text = str(row[review_col]).replace("\n", " ").strip()
-        lines.append(f"[리뷰번호 {review_no}] {rating_txt}{text}")
+
+        lines.append(
+            f"[리뷰ID {review_id}] {rating_txt}[후기본문] {text}"
+        )
 
     prompt = PROMPT_TEMPLATE.format(
         course_title=course_title,
@@ -201,18 +344,56 @@ def analyze_course(group, course_title, review_col, rating_col):
     response = client.responses.create(
         model=MODEL,
         input=prompt,
-        max_output_tokens=7000,
+        max_output_tokens=12000,
     )
 
     result = extract_json(response.output_text)
+
+    # 기본값
+    result.setdefault("executive_summary", "")
     result.setdefault("keywords", [])
-    result.setdefault("sentiment_summary", {})
+    result.setdefault("review_sentiments", [])
+    result.setdefault(
+        "sentiment_reasons",
+        {"positive": [], "neutral": [], "negative": []},
+    )
     result.setdefault("improvement_suggestions", [])
     result.setdefault("individual_feedback", [])
 
-    return result, len(sample)
+    # 키워드 빈도는 모델 숫자를 쓰지 않고 Python에서 재계산
+    result["keywords"] = compute_keyword_frequencies(
+        sample,
+        review_col,
+        result.get("keywords", [])[:10],
+    )
+
+    # 리뷰별 감성 label을 Python으로 집계
+    valid_ids = set(sample["_analysis_review_id"].astype(str))
+    sentiment_map = {}
+
+    for item in result.get("review_sentiments", []):
+        rid = str(item.get("review_id", ""))
+        sentiment = str(item.get("sentiment", "")).lower()
+
+        if rid in valid_ids and sentiment in {"positive", "neutral", "negative"}:
+            sentiment_map[rid] = sentiment
+
+    counts = {
+        "positive": sum(v == "positive" for v in sentiment_map.values()),
+        "neutral": sum(v == "neutral" for v in sentiment_map.values()),
+        "negative": sum(v == "negative" for v in sentiment_map.values()),
+    }
+
+    result["sentiment_counts"] = counts
+    result["classified_reviews"] = len(sentiment_map)
+    result["analysis_review_count"] = len(sample)
+
+    return result
 
 
+# =========================================================
+# 4. 데이터 선택
+# =========================================================
 st.subheader("1. 분석 데이터")
 
 source = st.radio(
@@ -232,7 +413,7 @@ if source == "샘플 데이터로 체험":
     else:
         st.warning(
             "`reviews_seoul_center_final.csv` 파일이 앱 폴더에 없습니다. "
-            "GitHub 저장소에 app.py와 같은 위치로 올리거나, 아래에서 직접 업로드해주세요."
+            "GitHub 저장소에 app.py와 같은 위치로 올리거나 직접 업로드해주세요."
         )
         source = "내 파일 업로드"
 
@@ -241,6 +422,7 @@ if source == "내 파일 업로드":
         "CSV 또는 Excel(.xlsx) 파일을 업로드하세요.",
         type=["csv", "xlsx"],
     )
+
     if uploaded_file is not None:
         try:
             df = load_dataframe(uploaded_file)
@@ -254,27 +436,50 @@ if df is None:
     st.stop()
 
 
+# =========================================================
+# 5. 컬럼 인식
+# =========================================================
 course_col = find_col(
     df,
-    ["과정명", "훈련과정명", "훈련과정", "course", "title"],
-)
-review_col = find_col(
-    df,
-    ["후기", "리뷰본문", "리뷰", "의견", "review", "content", "text"],
-)
-rating_col = find_col(
-    df,
-    ["별점", "평점", "점수", "rating", "score"],
+    exact_candidates=["title", "과정명", "훈련과정명", "course"],
+    partial_candidates=["훈련과정"],
 )
 
-c1, c2, c3 = st.columns(3)
+review_col = find_col(
+    df,
+    exact_candidates=[
+        "content",
+        "review_text",
+        "reviewtext",
+        "후기",
+        "리뷰본문",
+        "리뷰내용",
+        "의견",
+        "text",
+    ],
+    partial_candidates=["후기내용", "수강후기", "교육후기"],
+    exclude=["review_id", "reviewid", "id"],
+)
+
+rating_col = find_col(
+    df,
+    exact_candidates=["rating", "별점", "평점", "score", "점수"],
+)
+
+id_col = find_col(
+    df,
+    exact_candidates=["review_id", "reviewid", "리뷰id", "후기id"],
+)
+
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("과정명 컬럼", course_col or "인식 실패")
-c2.metric("후기 컬럼", review_col or "인식 실패")
+c2.metric("후기본문 컬럼", review_col or "인식 실패")
 c3.metric("별점 컬럼", rating_col or "없음")
+c4.metric("리뷰ID 컬럼", id_col or "없음")
 
 if course_col is None or review_col is None:
     st.error(
-        "과정명 또는 후기 컬럼을 자동으로 찾지 못했습니다. "
+        "과정명 또는 후기본문 컬럼을 자동으로 찾지 못했습니다. "
         "예: title/과정명, content/후기 형태의 컬럼이 필요합니다."
     )
     st.stop()
@@ -286,32 +491,79 @@ if df.empty:
     st.stop()
 
 
+# =========================================================
+# 6. 전체 데이터 대시보드
+# =========================================================
 st.subheader("2. 데이터 요약")
 
+overview = build_course_overview(df, course_col, rating_col)
+
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("후기 수", f"{len(df):,}건")
+m1.metric("전체 후기", f"{len(df):,}건")
 m2.metric("과정 수", f"{df[course_col].nunique():,}개")
 
 if rating_col and df[rating_col].notna().any():
-    m3.metric("평균 별점", f"{df[rating_col].mean():.2f}")
+    m3.metric("전체 평균 별점", f"{df[rating_col].mean():.2f}")
 else:
-    m3.metric("평균 별점", "-")
+    m3.metric("전체 평균 별점", "-")
 
 m4.metric("분석 모델", "GPT-5.6 Luna")
 
-with st.expander("원본 데이터 미리보기"):
-    st.dataframe(df.head(30), use_container_width=True)
+left_overview, right_overview = st.columns([1.15, 0.85])
 
-if len(df) > MAX_REVIEWS_PER_COURSE:
-    st.caption(
-        f"※ 과정별 후기가 {MAX_REVIEWS_PER_COURSE}건을 초과하면 "
-        f"API 비용과 처리시간을 줄이기 위해 최대 {MAX_REVIEWS_PER_COURSE}건을 표본 분석합니다."
+with left_overview:
+    st.markdown("#### 과정별 현황")
+    st.dataframe(
+        overview,
+        use_container_width=True,
+        hide_index=True,
     )
 
+with right_overview:
+    st.markdown("#### 과정별 후기 수")
+    course_count_chart = overview[["과정명", "후기수"]].set_index("과정명")
+    st.bar_chart(course_count_chart, horizontal=True)
 
+if rating_col and df[rating_col].notna().any():
+    st.markdown("#### 별점 분포")
+
+    rating_dist = (
+        df[rating_col]
+        .dropna()
+        .round(1)
+        .value_counts()
+        .sort_index()
+        .rename_axis("별점")
+        .reset_index(name="후기수")
+    )
+
+    st.bar_chart(
+        rating_dist.set_index("별점")["후기수"],
+        use_container_width=True,
+    )
+
+with st.expander("원본 데이터 미리보기"):
+    display_cols = [x for x in [id_col, course_col, rating_col, review_col] if x]
+    st.dataframe(
+        df[display_cols].head(30),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+st.caption(
+    f"※ 과정별 후기가 {MAX_REVIEWS_PER_COURSE}건을 초과하면 "
+    f"API 비용과 처리시간을 줄이기 위해 최대 {MAX_REVIEWS_PER_COURSE}건을 "
+    "재현 가능한 방식(random_state=42)으로 표본 분석합니다."
+)
+
+
+# =========================================================
+# 7. 분석 실행
+# =========================================================
 st.subheader("3. AI 분석")
 
 courses = df[course_col].dropna().astype(str).unique().tolist()
+
 selected_courses = st.multiselect(
     "분석할 과정을 선택하세요.",
     options=courses,
@@ -325,48 +577,50 @@ if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
 
     results = {}
     errors = {}
-    analyzed_counts = {}
 
-    progress = st.progress(0, text="분석 준비 중...")
+    progress_bar = st.progress(0)
+    status_box = st.empty()
 
-    for i, course in enumerate(selected_courses):
-        progress.progress(
-            i / len(selected_courses),
-            text=f"분석 중: {course}",
+    for i, course in enumerate(selected_courses, start=1):
+        status_box.info(
+            f"🔄 {i}/{len(selected_courses)} 과정 분석 중 · {course}"
         )
 
         group = df[df[course_col].astype(str) == str(course)]
 
         try:
-            result, analyzed_n = analyze_course(
+            results[course] = analyze_course(
                 group=group,
                 course_title=course,
                 review_col=review_col,
                 rating_col=rating_col,
+                id_col=id_col,
             )
-            results[course] = result
-            analyzed_counts[course] = analyzed_n
         except Exception as e:
             errors[course] = str(e)
 
-        progress.progress(
-            (i + 1) / len(selected_courses),
-            text=f"처리 완료: {course}",
-        )
+        progress_bar.progress(i / len(selected_courses))
 
-    progress.empty()
+    status_box.success(
+        f"✅ 분석 완료 · 총 {len(selected_courses)}개 과정 처리"
+    )
+
+    # 완료 상태를 잠깐 보여준 뒤 진행바는 그대로 유지
+    time.sleep(0.2)
+
     st.session_state["results"] = results
     st.session_state["errors"] = errors
-    st.session_state["analyzed_counts"] = analyzed_counts
     st.session_state["source_name"] = source_name
 
 
+# =========================================================
+# 8. 결과 렌더링
+# =========================================================
 if "results" in st.session_state:
     st.subheader("4. 분석 결과")
 
     results = st.session_state["results"]
     errors = st.session_state.get("errors", {})
-    analyzed_counts = st.session_state.get("analyzed_counts", {})
 
     if errors:
         with st.expander("⚠️ 분석 오류 확인"):
@@ -377,114 +631,147 @@ if "results" in st.session_state:
         st.divider()
         st.header(f"📘 {course}")
 
-        sentiment = result.get("sentiment_summary", {})
-        pos = int(sentiment.get("positive_count", 0) or 0)
-        neu = int(sentiment.get("neutral_count", 0) or 0)
-        neg = int(sentiment.get("negative_count", 0) or 0)
-        total_sent = pos + neu + neg
+        summary = result.get("executive_summary", "")
+        if summary:
+            st.info(f"**AI 핵심 요약**\n\n{summary}")
+
+        counts = result.get(
+            "sentiment_counts",
+            {"positive": 0, "neutral": 0, "negative": 0},
+        )
+
+        pos = int(counts.get("positive", 0) or 0)
+        neu = int(counts.get("neutral", 0) or 0)
+        neg = int(counts.get("negative", 0) or 0)
+
+        classified = int(result.get("classified_reviews", 0) or 0)
+        analysis_n = int(result.get("analysis_review_count", 0) or 0)
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("분석 후기", f"{analyzed_counts.get(course, 0):,}건")
+        k1.metric("분석 후기", f"{analysis_n:,}건")
 
-        if total_sent > 0:
-            k2.metric("긍정", f"{pos:,}건", f"{pos / total_sent * 100:.1f}%")
-            k3.metric("중립", f"{neu:,}건", f"{neu / total_sent * 100:.1f}%")
-            k4.metric("부정", f"{neg:,}건", f"{neg / total_sent * 100:.1f}%")
+        if classified > 0:
+            k2.metric("긍정", f"{pos:,}건", f"{pos / classified * 100:.1f}%")
+            k3.metric("중립", f"{neu:,}건", f"{neu / classified * 100:.1f}%")
+            k4.metric("부정", f"{neg:,}건", f"{neg / classified * 100:.1f}%")
         else:
             k2.metric("긍정", "-")
             k3.metric("중립", "-")
             k4.metric("부정", "-")
 
-        left, right = st.columns([1.1, 0.9])
+        if classified != analysis_n:
+            st.caption(
+                f"※ 감성 분류 응답 {classified:,}건 / 분석 대상 {analysis_n:,}건. "
+                "모델 응답 누락이 있을 수 있으므로 최종 업무 적용 시 확인이 필요합니다."
+            )
+
+        left, right = st.columns([1.15, 0.85])
 
         with left:
             st.markdown("#### 🔑 핵심 키워드 TOP 10")
-            keywords = result.get("keywords", [])[:10]
 
-            if keywords:
-                keyword_rows = []
-                for kw in keywords:
-                    keyword_rows.append(
-                        {
-                            "키워드": kw.get("word", ""),
-                            "빈도": int(kw.get("frequency", 0) or 0),
-                            "의미": kw.get("meaning", ""),
-                        }
-                    )
+            keyword_rows = []
 
+            for kw in result.get("keywords", [])[:10]:
+                keyword_rows.append(
+                    {
+                        "키워드": kw.get("word", ""),
+                        "빈도": int(kw.get("frequency", 0) or 0),
+                        "의미": kw.get("meaning", ""),
+                    }
+                )
+
+            if keyword_rows:
                 keyword_df = pd.DataFrame(keyword_rows)
+
                 st.dataframe(
                     keyword_df,
                     use_container_width=True,
                     hide_index=True,
                 )
 
-                if keyword_df["빈도"].sum() > 0:
-                    st.bar_chart(
-                        keyword_df.set_index("키워드")["빈도"],
-                        horizontal=True,
-                    )
+                st.bar_chart(
+                    keyword_df.set_index("키워드")["빈도"],
+                    horizontal=True,
+                )
             else:
-                st.info("키워드 결과가 없습니다.")
+                st.info("키워드 분석 결과가 없습니다.")
 
         with right:
-            st.markdown("#### 😊 감성분포")
+            st.markdown("#### 😊 감성 분포")
+
             sentiment_df = pd.DataFrame(
                 {
                     "감성": ["긍정", "중립", "부정"],
                     "건수": [pos, neu, neg],
                 }
             )
-            st.bar_chart(sentiment_df.set_index("감성"))
 
+            st.bar_chart(
+                sentiment_df.set_index("감성")["건수"],
+                use_container_width=True,
+            )
+
+        reasons = result.get("sentiment_reasons", {})
         reason_cols = st.columns(3)
 
         with reason_cols[0]:
-            st.markdown("##### 긍정 주요 사유")
-            positive_reasons = safe_list(sentiment, "positive_reasons", 5)
-            if positive_reasons:
-                for x in positive_reasons:
-                    st.markdown(f"- {x}")
+            st.markdown("##### 👍 긍정 주요 사유")
+            values = safe_list(reasons, "positive", 5)
+
+            if values:
+                for item in values:
+                    st.markdown(f"- {item}")
             else:
                 st.caption("해당 의견 없음")
 
         with reason_cols[1]:
-            st.markdown("##### 중립 주요 사유")
-            neutral_reasons = safe_list(sentiment, "neutral_reasons", 5)
-            if neutral_reasons:
-                for x in neutral_reasons:
-                    st.markdown(f"- {x}")
+            st.markdown("##### ➖ 중립 주요 사유")
+            values = safe_list(reasons, "neutral", 5)
+
+            if values:
+                for item in values:
+                    st.markdown(f"- {item}")
             else:
                 st.caption("해당 의견 없음")
 
         with reason_cols[2]:
-            st.markdown("##### 부정·개선 요구 주요 사유")
-            negative_reasons = safe_list(sentiment, "negative_reasons", 5)
-            if negative_reasons:
-                for x in negative_reasons:
-                    st.markdown(f"- {x}")
+            st.markdown("##### 👎 부정·개선 요구 주요 사유")
+            values = safe_list(reasons, "negative", 5)
+
+            if values:
+                for item in values:
+                    st.markdown(f"- {item}")
             else:
                 st.caption("해당 의견 없음")
 
         st.markdown("#### 🛠️ 개선 방안 5가지")
+
         improvements = result.get("improvement_suggestions", [])[:5]
 
         if improvements:
-            for idx, imp in enumerate(improvements, start=1):
-                st.markdown(f"**{idx}.** {imp}")
+            for idx, improvement in enumerate(improvements, start=1):
+                st.markdown(f"**{idx}.** {improvement}")
         else:
             st.info("개선방안 결과가 없습니다.")
 
         st.markdown("#### 💬 개인별 피드백")
-        feedback_list = result.get("individual_feedback", [])[:10]
 
-        if feedback_list:
-            for fb in feedback_list:
-                review_no = fb.get("review_no", "")
+        feedbacks = result.get("individual_feedback", [])[:10]
+
+        if feedbacks:
+            for fb in feedbacks:
+                review_id = fb.get("review_id", "")
                 snippet = fb.get("review_snippet", "")
-                title = f"리뷰 {review_no} · {snippet}" if review_no else snippet
+
+                title = (
+                    f"교육생 의견 #{review_id} · {snippet}"
+                    if review_id
+                    else snippet
+                )
 
                 with st.expander(title or "개인별 피드백"):
+                    st.markdown("**AI 피드백**")
                     st.write(fb.get("feedback", ""))
         else:
             st.info("개인별 피드백 결과가 없습니다.")
