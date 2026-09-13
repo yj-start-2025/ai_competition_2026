@@ -12,22 +12,6 @@ from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Table,
-    TableStyle,
-    PageBreak,
-)
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-
 
 # =========================================================
 # 0. 기본 설정
@@ -230,6 +214,251 @@ def result_to_rows(result):
     }
 
 
+
+def _keyword_terms(result):
+    terms = []
+    for kw in result.get("keywords", [])[:10]:
+        group = [kw.get("word", "")]
+        aliases = kw.get("aliases", [])
+        if isinstance(aliases, list):
+            group.extend(aliases)
+        group = [compact_text(x) for x in group if str(x).strip()]
+        if group:
+            terms.append(group)
+    return terms
+
+
+def _review_information_score(text, keyword_groups):
+    raw = str(text).strip()
+    compact = compact_text(raw)
+
+    # 너무 긴 글만 무조건 뽑히지 않도록 길이 점수는 300자에서 포화
+    length_score = min(len(raw), 300) / 300
+
+    covered = set()
+    for i, group in enumerate(keyword_groups):
+        if any(term and term in compact for term in group):
+            covered.add(i)
+
+    keyword_score = min(len(covered), 4) / 4
+
+    cue_words = [
+        "좋", "도움", "유익", "추천", "만족",
+        "아쉽", "부족", "어렵", "불편", "개선",
+        "프로젝트", "강사", "취업", "실습", "장비",
+        "커리큘럼", "난이도", "시간", "환경",
+    ]
+    cue_hits = sum(1 for cue in cue_words if cue in raw)
+    cue_score = min(cue_hits, 5) / 5
+
+    score = 0.45 * length_score + 0.40 * keyword_score + 0.15 * cue_score
+    return score, covered
+
+
+def select_representative_reviews(sample, result, review_col, id_col, target_n=10):
+    """
+    대표 후기 선정:
+    1) 긍정/중립/부정 층화(기본 4/2/4)
+    2) 후기 구체성/정보량
+    3) 주요 키워드·이슈 다양성
+    4) 부정·개선요구 의견을 약간 우대
+    """
+    work = sample.copy()
+
+    if id_col:
+        work["_rid"] = work[id_col].astype(str)
+    else:
+        work["_rid"] = (work.index + 1).astype(str)
+
+    if len(work) <= target_n:
+        work["_sentiment"] = "neutral"
+        sentiment_map = {
+            str(item.get("review_id", "")): str(item.get("sentiment", "")).lower()
+            for item in result.get("review_sentiments", [])
+        }
+        work["_sentiment"] = work["_rid"].map(sentiment_map).fillna("neutral")
+        work["_selection_reason"] = "전체 후기"
+        return work
+
+    sentiment_map = {
+        str(item.get("review_id", "")): str(item.get("sentiment", "")).lower()
+        for item in result.get("review_sentiments", [])
+        if str(item.get("sentiment", "")).lower()
+        in {"positive", "neutral", "negative"}
+    }
+    work["_sentiment"] = work["_rid"].map(sentiment_map).fillna("neutral")
+
+    keyword_groups = _keyword_terms(result)
+    score_meta = work[review_col].apply(
+        lambda x: _review_information_score(x, keyword_groups)
+    )
+    work["_info_score"] = score_meta.apply(lambda x: x[0])
+    work["_covered_keywords"] = score_meta.apply(lambda x: x[1])
+
+    quotas = {"positive": 4, "neutral": 2, "negative": 4}
+    selected_indices = []
+    globally_covered = set()
+
+    # 개선 이슈가 묻히지 않도록 부정 -> 중립 -> 긍정 순으로 대표성 확보
+    for sentiment in ["negative", "neutral", "positive"]:
+        candidates = work[work["_sentiment"] == sentiment].copy()
+        quota = min(quotas[sentiment], len(candidates))
+
+        for _ in range(quota):
+            if candidates.empty:
+                break
+
+            candidates["_diversity_bonus"] = candidates["_covered_keywords"].apply(
+                lambda s: len(set(s) - globally_covered) * 0.12
+            )
+            candidates["_rank_score"] = (
+                candidates["_info_score"] + candidates["_diversity_bonus"]
+            )
+
+            chosen_idx = candidates["_rank_score"].idxmax()
+            selected_indices.append(chosen_idx)
+            globally_covered |= set(candidates.loc[chosen_idx, "_covered_keywords"])
+            candidates = candidates.drop(index=chosen_idx)
+
+    # 특정 감성의 후기가 부족하면 남는 자리를 전체 후보에서 채운다.
+    remaining = target_n - len(selected_indices)
+    candidates = work.drop(index=selected_indices, errors="ignore").copy()
+
+    for _ in range(min(remaining, len(candidates))):
+        candidates["_diversity_bonus"] = candidates["_covered_keywords"].apply(
+            lambda s: len(set(s) - globally_covered) * 0.12
+        )
+        candidates["_sentiment_bonus"] = candidates["_sentiment"].map(
+            {"negative": 0.10, "neutral": 0.05, "positive": 0.0}
+        )
+        candidates["_rank_score"] = (
+            candidates["_info_score"]
+            + candidates["_diversity_bonus"]
+            + candidates["_sentiment_bonus"]
+        )
+
+        chosen_idx = candidates["_rank_score"].idxmax()
+        selected_indices.append(chosen_idx)
+        globally_covered |= set(candidates.loc[chosen_idx, "_covered_keywords"])
+        candidates = candidates.drop(index=chosen_idx)
+
+    selected = work.loc[selected_indices].copy()
+    selected["_selection_reason"] = selected["_sentiment"].map(
+        {
+            "positive": "긍정 대표 의견",
+            "neutral": "중립·혼합 대표 의견",
+            "negative": "부정·개선요구 대표 의견",
+        }
+    )
+    return selected
+
+
+FEEDBACK_PROMPT_TEMPLATE = """
+당신은 직업훈련기관의 교육품질 개선 담당자입니다.
+
+아래 대표 수강후기는 단순 무작위가 아니라
+긍정·중립·부정 의견의 균형, 후기의 구체성,
+주요 키워드와 이슈의 다양성을 고려하여 선정되었습니다.
+
+각 후기 원문을 충분히 반영하여 해당 교육생에게 전달할 수 있는
+정중하고 구체적인 피드백을 작성하십시오.
+
+규칙:
+- review_id는 제공된 실제 ID를 그대로 사용
+- feedback은 2~4문장
+- 단순 감사 인사에 그치지 말고 의견을 어떻게 유지·보완·개선할지 드러낼 것
+- 후기에서 확인되지 않는 사실을 만들지 말 것
+- 개인정보를 추정하지 말 것
+- 반드시 JSON만 반환
+
+[대표 후기]
+{reviews_block}
+
+{{
+  "individual_feedback": [
+    {{
+      "review_id": "실제 리뷰ID",
+      "feedback": "개인별 피드백"
+    }}
+  ]
+}}
+"""
+
+
+def generate_feedback_for_selected(selected, review_col, id_col):
+    lines = []
+
+    for _, row in selected.iterrows():
+        rid = str(row[id_col]) if id_col else str(row["_rid"])
+        sentiment = str(row["_sentiment"])
+        reason = str(row["_selection_reason"])
+        original = str(row[review_col]).replace("\n", " ").strip()
+
+        lines.append(
+            f"[리뷰ID {rid}] [감성 {sentiment}] [선정사유 {reason}] "
+            f"[원문] {original}"
+        )
+
+    prompt = FEEDBACK_PROMPT_TEMPLATE.format(
+        reviews_block="\n".join(lines)
+    )
+
+    response = client.responses.create(
+        model=MODEL,
+        input=prompt,
+        max_output_tokens=5000,
+    )
+
+    payload = extract_json(response.output_text)
+    feedbacks = payload.get("individual_feedback", [])
+
+    original_lookup = {}
+    meta_lookup = {}
+
+    for _, row in selected.iterrows():
+        rid = str(row[id_col]) if id_col else str(row["_rid"])
+        original_lookup[rid] = str(row[review_col]).strip()
+        meta_lookup[rid] = {
+            "sentiment": str(row["_sentiment"]),
+            "selection_reason": str(row["_selection_reason"]),
+        }
+
+    cleaned = []
+    seen = set()
+
+    for item in feedbacks:
+        rid = str(item.get("review_id", ""))
+        if rid in original_lookup and rid not in seen:
+            cleaned.append(
+                {
+                    "review_id": rid,
+                    "sentiment": meta_lookup[rid]["sentiment"],
+                    "selection_reason": meta_lookup[rid]["selection_reason"],
+                    "original_review": original_lookup[rid],
+                    "feedback": str(item.get("feedback", "")).strip(),
+                }
+            )
+            seen.add(rid)
+
+    # 모델이 일부 항목을 누락해도 대표 후기 자체는 화면과 Word에 남긴다.
+    for rid, original in original_lookup.items():
+        if rid not in seen:
+            cleaned.append(
+                {
+                    "review_id": rid,
+                    "sentiment": meta_lookup[rid]["sentiment"],
+                    "selection_reason": meta_lookup[rid]["selection_reason"],
+                    "original_review": original,
+                    "feedback": (
+                        "대표 의견으로 선정되었습니다. "
+                        "해당 의견을 교육과정 운영 개선 시 검토하겠습니다."
+                    ),
+                }
+            )
+
+    return cleaned[:10]
+
+
 def build_docx_report(results):
     doc = Document()
 
@@ -309,12 +538,22 @@ def build_docx_report(results):
         doc.add_heading("개인별 피드백", level=2)
         for fb in result.get("individual_feedback", [])[:10]:
             rid = fb.get("review_id", "")
-            snippet = fb.get("review_snippet", "")
+            sentiment = fb.get("sentiment", "")
+            selection_reason = fb.get("selection_reason", "")
+            original_review = fb.get("original_review", "")
             feedback = fb.get("feedback", "")
+
+            sentiment_label = {
+                "positive": "긍정",
+                "neutral": "중립",
+                "negative": "부정",
+            }.get(sentiment, sentiment)
+
             doc.add_paragraph(
-                f"교육생 의견 #{rid} - {snippet}",
+                f"교육생 의견 #{rid} ({sentiment_label}) - {selection_reason}",
                 style="List Bullet",
             )
+            doc.add_paragraph(f"원문: {original_review}")
             doc.add_paragraph(f"AI 피드백: {feedback}")
 
         if idx < len(results):
@@ -328,198 +567,6 @@ def build_docx_report(results):
 
     buffer = io.BytesIO()
     doc.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def build_pdf_report(results):
-    # ReportLab 기본 CID Korean font
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
-        pdfmetrics.registerFont(UnicodeCIDFont("HYGoThic-Medium"))
-        body_font = "HYSMyeongJo-Medium"
-        bold_font = "HYGoThic-Medium"
-    except Exception:
-        body_font = "Helvetica"
-        bold_font = "Helvetica-Bold"
-
-    buffer = io.BytesIO()
-
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=15 * mm,
-        leftMargin=15 * mm,
-        topMargin=15 * mm,
-        bottomMargin=15 * mm,
-    )
-
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle(
-        "KTitle",
-        parent=styles["Title"],
-        fontName=bold_font,
-        fontSize=18,
-        leading=24,
-        alignment=TA_CENTER,
-        spaceAfter=10,
-    )
-
-    h1 = ParagraphStyle(
-        "KH1",
-        parent=styles["Heading1"],
-        fontName=bold_font,
-        fontSize=14,
-        leading=19,
-        spaceBefore=8,
-        spaceAfter=6,
-    )
-
-    h2 = ParagraphStyle(
-        "KH2",
-        parent=styles["Heading2"],
-        fontName=bold_font,
-        fontSize=11,
-        leading=15,
-        spaceBefore=6,
-        spaceAfter=4,
-    )
-
-    body = ParagraphStyle(
-        "KBody",
-        parent=styles["BodyText"],
-        fontName=body_font,
-        fontSize=9,
-        leading=13,
-        spaceAfter=4,
-    )
-
-    story = [
-        Paragraph("수강후기 AI 분석 리포트", title_style),
-        Paragraph(
-            "생성형 AI를 활용하여 과정별 핵심 키워드, 감성, 주요 의견, "
-            "개선방안 및 개인별 피드백을 자동 분석한 결과입니다.",
-            body,
-        ),
-        Spacer(1, 4 * mm),
-    ]
-
-    for idx, (course, result) in enumerate(results.items(), start=1):
-        story.append(Paragraph(f"{idx}. {course}", h1))
-
-        summary = result.get("executive_summary", "")
-        if summary:
-            story.append(Paragraph("AI 핵심 요약", h2))
-            story.append(Paragraph(summary, body))
-
-        counts = result_to_rows(result)
-
-        story.append(Paragraph("감성 분석", h2))
-        sentiment_data = [
-            ["분석 후기", "긍정", "중립", "부정"],
-            [
-                str(counts["analysis_n"]),
-                str(counts["positive"]),
-                str(counts["neutral"]),
-                str(counts["negative"]),
-            ],
-        ]
-        sentiment_table = Table(
-            sentiment_data,
-            colWidths=[35 * mm, 35 * mm, 35 * mm, 35 * mm],
-        )
-        sentiment_table.setStyle(
-            TableStyle([
-                ("FONTNAME", (0, 0), (-1, -1), body_font),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ])
-        )
-        story.append(sentiment_table)
-        story.append(Spacer(1, 3 * mm))
-
-        story.append(Paragraph("핵심 키워드 TOP 10", h2))
-        kw_data = [["키워드", "빈도", "의미"]]
-        for kw in result.get("keywords", [])[:10]:
-            kw_data.append([
-                str(kw.get("word", "")),
-                str(kw.get("frequency", 0)),
-                str(kw.get("meaning", "")),
-            ])
-
-        kw_table = Table(
-            kw_data,
-            colWidths=[35 * mm, 18 * mm, 122 * mm],
-            repeatRows=1,
-        )
-        kw_table.setStyle(
-            TableStyle([
-                ("FONTNAME", (0, 0), (-1, -1), body_font),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ])
-        )
-        story.append(kw_table)
-        story.append(Spacer(1, 3 * mm))
-
-        reasons = result.get("sentiment_reasons", {})
-        for label, key in [
-            ("긍정 주요 사유", "positive"),
-            ("중립 주요 사유", "neutral"),
-            ("부정·개선 요구 주요 사유", "negative"),
-        ]:
-            story.append(Paragraph(label, h2))
-            vals = safe_list(reasons, key, 5)
-            if vals:
-                for v in vals:
-                    story.append(Paragraph(f"• {v}", body))
-            else:
-                story.append(Paragraph("해당 의견 없음", body))
-
-        story.append(Paragraph("개선 방안 5가지", h2))
-        for i, item in enumerate(
-            result.get("improvement_suggestions", [])[:5],
-            start=1,
-        ):
-            story.append(Paragraph(f"{i}. {item}", body))
-
-        story.append(Paragraph("개인별 피드백", h2))
-        for fb in result.get("individual_feedback", [])[:10]:
-            rid = fb.get("review_id", "")
-            snippet = fb.get("review_snippet", "")
-            feedback = fb.get("feedback", "")
-            story.append(
-                Paragraph(
-                    f"• 교육생 의견 #{rid} - {snippet}",
-                    body,
-                )
-            )
-            story.append(
-                Paragraph(
-                    f"AI 피드백: {feedback}",
-                    body,
-                )
-            )
-
-        if idx < len(results):
-            story.append(PageBreak())
-
-    story.append(
-        Spacer(1, 4 * mm)
-    )
-    story.append(
-        Paragraph(
-            "본 결과는 생성형 AI 기반 자동 분석 결과이며, 실제 업무 적용 시 담당자 최종 검토를 권장합니다.",
-            body,
-        )
-    )
-
-    doc.build(story)
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -568,14 +615,6 @@ PROMPT_TEMPLATE = """
 5. improvement_suggestions
 - 후기 내용에 직접 근거한 구체적이고 실행 가능한 개선방안 정확히 5개
 
-6. individual_feedback
-- 리뷰가 10개 이상이면 반드시 서로 다른 리뷰 10개를 선택
-- 리뷰가 10개 미만이면 가능한 리뷰 전부 선택
-- review_id에는 제공된 실제 [리뷰ID] 사용
-- review_snippet은 해당 리뷰 원문 일부(50자 이내)
-- feedback은 해당 의견에 대응하는 정중하고 구체적인 피드백
-- 단순 칭찬 반복보다 의견 반영, 추가 학습, 운영 보완 방향이 드러나게 작성
-
 중요:
 - 후기에서 확인되지 않는 사실을 만들지 마십시오.
 - 개인정보를 추정하거나 생성하지 마십시오.
@@ -605,15 +644,7 @@ PROMPT_TEMPLATE = """
   }},
   "improvement_suggestions": [
     "개선방안"
-  ],
-  "individual_feedback": [
-    {{
-      "review_id": "실제 리뷰ID",
-      "review_snippet": "원문 일부",
-      "feedback": "개인별 피드백"
-    }}
-  ]
-}}
+  ]}}
 """
 
 
@@ -694,6 +725,20 @@ def analyze_course(group, course_title, review_col, rating_col, id_col):
     result["sentiment_counts"] = counts
     result["classified_reviews"] = len(sentiment_map)
     result["analysis_review_count"] = len(sample)
+
+    representative = select_representative_reviews(
+        sample=sample,
+        result=result,
+        review_col=review_col,
+        id_col=id_col,
+        target_n=10,
+    )
+
+    result["individual_feedback"] = generate_feedback_for_selected(
+        selected=representative,
+        review_col=review_col,
+        id_col=id_col,
+    )
 
     return result
 
@@ -1055,20 +1100,36 @@ if "results" in st.session_state:
         else:
             st.info("개선방안 결과가 없습니다.")
 
-        st.markdown("#### 💬 개인별 피드백")
+        st.markdown("#### 💬 대표 교육생 의견 및 개인별 피드백")
+        st.caption(
+            "긍정·중립·부정 의견의 균형, 후기의 구체성, 주요 키워드·이슈 다양성을 "
+            "고려하여 대표 의견 최대 10건을 선정합니다."
+        )
 
         feedbacks = result.get("individual_feedback", [])[:10]
+
         if feedbacks:
             for fb in feedbacks:
                 review_id = fb.get("review_id", "")
-                snippet = fb.get("review_snippet", "")
+                sentiment = fb.get("sentiment", "")
+                selection_reason = fb.get("selection_reason", "")
+                original_review = fb.get("original_review", "")
+
+                sentiment_label = {
+                    "positive": "긍정",
+                    "neutral": "중립",
+                    "negative": "부정",
+                }.get(sentiment, sentiment)
+
                 title = (
-                    f"교육생 의견 #{review_id} · {snippet}"
+                    f"교육생 의견 #{review_id} · {sentiment_label} · {selection_reason}"
                     if review_id
-                    else snippet
+                    else "대표 교육생 의견"
                 )
 
-                with st.expander(title or "개인별 피드백"):
+                with st.expander(title):
+                    st.markdown("**원문 전체**")
+                    st.write(original_review)
                     st.markdown("**AI 피드백**")
                     st.write(fb.get("feedback", ""))
         else:
@@ -1077,7 +1138,7 @@ if "results" in st.session_state:
     st.divider()
     st.markdown("### 📄 분석 리포트 다운로드")
 
-    download_cols = st.columns(3)
+    download_cols = st.columns(2)
 
     with download_cols[0]:
         st.download_button(
@@ -1089,19 +1150,6 @@ if "results" in st.session_state:
         )
 
     with download_cols[1]:
-        try:
-            pdf_bytes = build_pdf_report(results)
-            st.download_button(
-                "📕 PDF 리포트 다운로드",
-                data=pdf_bytes,
-                file_name="수강후기_AI_분석_리포트.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.warning(f"PDF 생성 실패: {e}")
-
-    with download_cols[2]:
         st.download_button(
             "🧾 JSON 원본 다운로드",
             data=json.dumps(results, ensure_ascii=False, indent=2),
